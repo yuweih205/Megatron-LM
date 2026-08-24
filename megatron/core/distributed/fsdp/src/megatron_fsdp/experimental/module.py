@@ -38,12 +38,19 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
+    # Stream for the last-microbatch DP-outer reduction (HSDP all-reduce / HFSDP
+    # reduce-scatter). Distinct from reduce_scatter_stream only when
+    # overlap_dp_outer_reduction is set, so the DP-outer collective can progress
+    # concurrently with the DP-inner reductions; otherwise it aliases
+    # reduce_scatter_stream and the reduction stays serialized as before.
+    dp_outer_reduce_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    overlap_dp_outer_reduction: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -55,6 +62,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        overlap_dp_outer_reduction: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -64,10 +72,14 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            overlap_dp_outer_reduction: Whether the last-microbatch DP-outer reduction runs
+                on its own stream so it can overlap the DP-inner reductions. Ignored when
+                unify_communication_stream is set, since that forces a single stream.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.overlap_dp_outer_reduction = overlap_dp_outer_reduction
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -80,6 +92,13 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+        if overlap_dp_outer_reduction and not unify_communication_stream:
+            self.dp_outer_reduce_stream = torch.cuda.Stream(device)
+        else:
+            # Off by default (or when communication is unified): the DP-outer
+            # finalize shares the reduce-scatter stream, keeping the existing
+            # serialized behavior byte-for-byte.
+            self.dp_outer_reduce_stream = self.reduce_scatter_stream
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -385,6 +404,10 @@ class FsdpModule:
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
+            if context.dp_outer_reduce_stream is not context.reduce_scatter_stream:
+                # Same capture-join reasoning for the separate DP-outer reduction
+                # stream when overlap is enabled.
+                context.dp_outer_reduce_stream.wait_stream(current_stream)
 
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
