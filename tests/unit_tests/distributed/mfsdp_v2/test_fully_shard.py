@@ -455,6 +455,163 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     )
 
 
+def _run_overlap_parity(
+    distributed_setup, placements, num_microbatches, set_to_none, wrap_optimizer, label
+):
+    """Train an overlap-enabled 2-D DP model against single-rank SGD and compare losses.
+
+    Enables ``overlap_dp_outer_reduction`` so the last-microbatch DP-outer reduction
+    runs on its own stream. Overlap only reorders where the reduction executes, so the
+    losses must remain bit-identical to the serialized baseline.
+    """
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device, overlap_dp_outer_reduction=True) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    if wrap_optimizer:
+        fully_shard_optimizer(optimizer)
+
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+        losses = []
+        for step in range(5):
+            optimizer.zero_grad(set_to_none=set_to_none)
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                is_last = microbatch_index == num_microbatches - 1
+                with microbatch(context, is_last=is_last):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
+                logger.debug(
+                    "%s overlap parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                    log_prefix,
+                    rank,
+                    step,
+                    microbatch_index,
+                    loss,
+                )
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer, f"{label}-baseline")
+    sharded_losses = train(model, optimizer, label)
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg=f"{label} overlap losses did not match baseline losses.",
+    )
+
+
+@pytest.mark.parametrize("set_to_none", [True, False])
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_hsdp_overlap_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
+    """HSDP with the DP-outer all-reduce overlapped on its own stream matches baseline."""
+    _run_overlap_parity(
+        distributed_setup,
+        _hsdp_placements(),
+        num_microbatches,
+        set_to_none,
+        wrap_optimizer=False,
+        label="HSDP",
+    )
+
+
+@pytest.mark.parametrize("set_to_none", [True, False])
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_hfsdp_overlap_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
+    """HFSDP with the DP-outer reduce-scatter overlapped on its own stream matches baseline."""
+    _run_overlap_parity(
+        distributed_setup,
+        _hfsdp_placements(),
+        num_microbatches,
+        set_to_none,
+        wrap_optimizer=True,
+        label="HFSDP",
+    )
+
+
+def test_hsdp_overlap_preserves_collective_counts(distributed_setup):
+    """Overlap moves the DP-outer all-reduce to its own stream without changing counts.
+
+    The finalize still fires exactly one DP-outer all-reduce per parameter group on the
+    last microbatch and one DP-inner reduce-scatter per microbatch; only the stream the
+    all-reduce runs on differs, so the linked-kernel counts match the serialized path.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    num_children = 2
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device)
+    with fully_shard_context(device=device, overlap_dp_outer_reduction=True) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    num_microbatches = 3
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train_one_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+            is_last = microbatch_index == num_microbatches - 1
+            with microbatch(context, is_last=is_last):
+                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                (loss / num_microbatches).backward()
+        optimizer.step()
+
+    train_one_step()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_step()
+        torch.cuda.synchronize(device)
+
+    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    allreduce_kernels = collect_linked_kernels(prof, _ALLREDUCE_OP_NAME_SUBSTRING)
+    assert len(allreduce_kernels) == num_children + 1, [event.name for event in prof.events()]
+    assert len(reduce_scatter_kernels) == len(allreduce_kernels) * num_microbatches, (
+        f"Expected reduce-scatter ({len(reduce_scatter_kernels)}) to be {num_microbatches}x "
+        f"the DP-outer all-reduce count ({len(allreduce_kernels)})."
+    )
+
+
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
