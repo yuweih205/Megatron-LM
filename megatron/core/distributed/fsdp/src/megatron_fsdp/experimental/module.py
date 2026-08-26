@@ -153,6 +153,10 @@ class FsdpContext:
 
         def post_backward_final_callback() -> None:
             self.current_stream().wait_stream(self.reduce_scatter_stream)
+            if self.dp_outer_reduce_stream is not self.reduce_scatter_stream:
+                # The overlapped DP-outer reduction finalizes .grad on its own
+                # stream; order consumers (optimizer.step) after it as well.
+                self.current_stream().wait_stream(self.dp_outer_reduce_stream)
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -215,8 +219,10 @@ class FsdpModule:
                 mixed_precision_policy=mixed_precision_policy,
                 allgather_stream=context.allgather_stream,
                 reduce_scatter_stream=context.reduce_scatter_stream,
+                dp_outer_reduce_stream=context.dp_outer_reduce_stream,
                 grad_divisor=grad_divisor,
                 use_symmetric_memory=use_symmetric_memory,
+                overlap_dp_outer_reduction=context.overlap_dp_outer_reduction,
             )
             for group_parameters in _group_parameters(owned_parameters)
         ]
@@ -425,10 +431,19 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and launch their reductions.
+
+        When overlap is enabled, the last-microbatch DP-outer reduction runs on its
+        own stream so a group's DP-outer reduction overlaps the next group's DP-inner
+        reduction; otherwise both share the reduce-scatter stream and stay serialized.
+        """
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
+        dp_outer_reduce_stream = context.dp_outer_reduce_stream
         current_stream = context.current_stream()
+        overlap_dp_outer = (
+            context.is_last_microbatch and dp_outer_reduce_stream is not reduce_scatter_stream
+        )
 
         for group in self._parameter_groups:
             if not group.requires_grad:
@@ -441,8 +456,19 @@ class FsdpModule:
             group.copy_gradients_to_partial_buffer(partial_grad)
 
             reduce_scatter_stream.wait_stream(current_stream)
-            with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+            if overlap_dp_outer:
+                # DP-inner reduce on the reduce-scatter stream, then the DP-outer
+                # finalize on its own stream so it overlaps the following group's
+                # DP-inner reduce. The finalize only reads the accumulator, so it
+                # stays alive on the reduce-scatter stream across the handoff.
+                with torch.cuda.stream(reduce_scatter_stream):
+                    group.reduce_into_main_grad(partial_grad)
+                dp_outer_reduce_stream.wait_stream(reduce_scatter_stream)
+                with torch.cuda.stream(dp_outer_reduce_stream):
+                    group.finalize_dp_outer_reduction()
+            else:
+                with torch.cuda.stream(reduce_scatter_stream):
+                    group.reduce_partial_gradients(partial_grad, context.is_last_microbatch)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

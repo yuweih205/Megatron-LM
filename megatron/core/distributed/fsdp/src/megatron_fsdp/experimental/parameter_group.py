@@ -82,6 +82,14 @@ class FsdpParameterGroup:
     main_weight: DBuffer
     model_weight: DBuffer
     main_grad: DBuffer | None
+    # Persistent DP-outer-reduced gradient buffer for the overlap path, owned by
+    # the DP-outer stream. None unless overlap_dp_outer_reduction is enabled.
+    _dp_outer_reduced_grad: DBuffer | None
+    _overlap_dp_outer_reduction: bool
+    # True at the first accumulation of each step. In the overlap path .grad binds
+    # to the DP-outer-reduced buffer, so zero_grad(set_to_none=False) zeros that
+    # buffer rather than main_grad; this flag drives an explicit main_grad reset.
+    _pending_accumulation_reset: bool
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
@@ -95,8 +103,10 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         allgather_stream: torch.cuda.Stream,
         reduce_scatter_stream: torch.cuda.Stream,
+        dp_outer_reduce_stream: torch.cuda.Stream | None = None,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        overlap_dp_outer_reduction: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -108,11 +118,17 @@ class FsdpParameterGroup:
             mixed_precision_policy: Precision policy for main weights and gradients.
             allgather_stream: Stream used to allocate model weights when a dtype cast is required.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
+            dp_outer_reduce_stream: Stream on which to allocate the DP-outer-reduced gradient
+                buffer when overlap is enabled. Defaults to reduce_scatter_stream.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            overlap_dp_outer_reduction: Allocate a separate DP-outer-reduced gradient buffer so
+                the last-microbatch DP-outer reduction can run on dp_outer_reduce_stream and
+                overlap the DP-inner reductions. See #6714.
         """
+        dp_outer_reduce_stream = dp_outer_reduce_stream or reduce_scatter_stream
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
@@ -191,6 +207,9 @@ class FsdpParameterGroup:
             )
 
         self.main_grad = None
+        self._overlap_dp_outer_reduction = overlap_dp_outer_reduction
+        self._dp_outer_reduced_grad = None
+        self._pending_accumulation_reset = True
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
@@ -210,6 +229,19 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
+            if overlap_dp_outer_reduction:
+                # Overlap keeps both the DP-inner accumulator (main_grad, on the
+                # reduce-scatter stream) and the DP-outer-reduced result alive at
+                # once. Allocate the latter on the DP-outer stream so the finalize
+                # runs there and each buffer frees on the stream that allocated it.
+                with torch.cuda.stream(dp_outer_reduce_stream):
+                    self._dp_outer_reduced_grad = DBuffer(
+                        mesh=self.mesh,
+                        placements=main_weight_placements,
+                        tensor_shapes=self.main_weight.layout.tensor_shapes,
+                        dtype=grad_dtype,
+                        device=self.main_weight.device,
+                    )
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -360,18 +392,14 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(
-        self, partial_grad: DBuffer, is_last_microbatch: bool = True
-    ) -> None:
-        """Reduce a packed partial gradient buffer into sharded parameter gradients.
+    def reduce_into_main_grad(self, partial_grad: DBuffer) -> None:
+        """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
 
-        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
-        accumulating each backward through the standard zero_grad contract; the
-        last microbatch reduces the DP-outer axes, finalizing main_grad to
-        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
-        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
-        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
-        rests finalized.
+        Leaves main_grad at the DP-outer-Partial accumulation placement and binds
+        each sharded parameter's ``.grad`` to it. The deferred DP-outer reduction is
+        applied separately -- in place by ``reduce_partial_gradients`` on the last
+        microbatch, or into a dedicated buffer by ``finalize_dp_outer_reduction``
+        when the DP-outer reduction overlaps on its own stream.
         """
         assert self.main_grad is not None
 
@@ -380,12 +408,12 @@ class FsdpParameterGroup:
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
 
-        # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Restore it to the DP-outer-Partial
-        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
-        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
-        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
-        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
+        # A non-accumulation main_grad means the previous step finalized it in place;
+        # this only happens on the first microbatch of the non-overlap path. Restore
+        # it to the DP-outer-Partial accumulation placement. HSDP's finalize keeps the
+        # buffer size (Replicate on DP-outer), so relabel it in place; HFSDP's finalize
+        # reduce-scattered DP-outer to a smaller optimizer-sharded buffer, so allocate a
+        # fresh one (zeroed only when we accumulate into it, i.e. sharded grads are set).
         if self.main_grad.placements != self._main_grad_placements:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
@@ -412,6 +440,15 @@ class FsdpParameterGroup:
                 if has_sharded_grads:
                     self.main_grad.local_buffer.zero_()
 
+        # In the overlap path main_grad is never finalized in place, so the reset
+        # above never triggers and ``.grad`` binds to the separate DP-outer buffer.
+        # zero_grad(set_to_none=False) therefore zeros that buffer, not main_grad, so
+        # zero the accumulator ourselves at the first accumulation of each step.
+        if self._overlap_dp_outer_reduction and self._pending_accumulation_reset:
+            if has_sharded_grads:
+                self.main_grad.local_buffer.zero_()
+            self._pending_accumulation_reset = False
+
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         ):
@@ -431,17 +468,51 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
+        self._bind_sharded_grads(self.main_grad)
+
+    def reduce_partial_gradients(
+        self, partial_grad: DBuffer, is_last_microbatch: bool = True
+    ) -> None:
+        """Reduce a packed partial gradient buffer into sharded parameter gradients.
+
+        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
+        accumulating each backward through the standard zero_grad contract; the
+        last microbatch reduces the DP-outer axes, finalizing main_grad to
+        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
+        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        rests finalized.
+        """
+        self.reduce_into_main_grad(partial_grad)
         if is_last_microbatch:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
+            # Finalize the deferred DP-outer reduction in place (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            assert self.main_grad is not None
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
+            self._bind_sharded_grads(self.main_grad)
 
-        # Make each sharded parameter's .grad consistent with the final main_grad.
+    def finalize_dp_outer_reduction(self) -> None:
+        """Reduce main_grad across DP-outer into the dedicated overlap buffer.
+
+        Runs on the DP-outer stream. main_grad (the accumulator) is only read -- the
+        all-reduce (HSDP) copies it first, the reduce-scatter (HFSDP) takes it as
+        input -- so it stays alive on the reduce-scatter stream while this reduction
+        proceeds. Rebinds each sharded ``.grad`` to the DP-outer-reduced buffer and
+        arms the accumulator reset for the next step.
+        """
+        assert self.main_grad is not None
+        assert self._dp_outer_reduced_grad is not None
+        self.main_grad.redistribute(self.main_weight.placements, out=self._dp_outer_reduced_grad)
+        self._bind_sharded_grads(self._dp_outer_reduced_grad)
+        self._pending_accumulation_reset = True
+
+    def _bind_sharded_grads(self, grad_buffer: DBuffer) -> None:
+        """Point each sharded parameter's ``.grad`` at the given reduced gradient buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+            fsdp_parameter.sharded.grad = grad_buffer.get_dtensor(index)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
