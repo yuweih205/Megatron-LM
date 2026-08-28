@@ -96,6 +96,9 @@ class HybridStack(MegatronModule):
         pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
+        mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
+        hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
+            to select hash-routed MoE layers.
     """
 
     def __init__(
@@ -111,6 +114,8 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        mtp_layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
     ) -> None:
@@ -146,6 +151,7 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.mtp_layer_number = mtp_layer_number
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -260,6 +266,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        hash_moe_layer_threshold=hash_moe_layer_threshold,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
@@ -285,7 +292,8 @@ class HybridStack(MegatronModule):
                     raise ValueError(
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
-
+            if self.is_mtp_layer and self.mtp_layer_number is not None:
+                self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
@@ -345,6 +353,25 @@ class HybridStack(MegatronModule):
             "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
         }
         return submodules
+
+    @staticmethod
+    def _set_mtp_layer_number_for_moe_metrics(
+        layer: torch.nn.Module, mtp_layer_number: int
+    ) -> None:
+        """Propagate the enclosing MTP depth to nested MTP MoE routers."""
+        for module in layer.modules():
+            router = getattr(module, "router", None)
+            if router is not None and getattr(router, "is_mtp_layer", False):
+                router.mtp_layer_number = mtp_layer_number
+
+    @staticmethod
+    def _uses_hash_routing(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer uses hash routing."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        if not isinstance(inner_layer, TransformerLayer):
+            return False
+        router = getattr(getattr(inner_layer, "mlp", None), "router", None)
+        return bool(getattr(router, "is_hash_layer", False))
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -425,6 +452,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -440,6 +468,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
+                TransformerLayer instances. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -545,6 +575,7 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
@@ -589,6 +620,8 @@ class HybridStack(MegatronModule):
                                 layer, HyperConnectionHybridLayer
                             ):
                                 layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                            if input_ids is not None and self._uses_hash_routing(layer):
+                                layer_kwargs["input_ids"] = input_ids
                             hidden_states, _ = layer(**layer_kwargs)
                         elif layer_cp_metadata is not None:
                             hidden_states = layer(

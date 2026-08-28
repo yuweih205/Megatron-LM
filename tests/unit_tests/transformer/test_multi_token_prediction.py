@@ -3199,6 +3199,7 @@ class TestMultiTokenPredictionHybrid:
             config=types.SimpleNamespace(
                 fine_grained_activation_offloading=False,
                 moe_paged_stash=False,
+                moe_n_hash_layers=0,
                 multi_latent_attention=False,
                 mtp_num_layers=1,
                 use_mup=False,
