@@ -757,9 +757,30 @@ def get_rollout_generator(
     return _ROLLOUT_GENERATOR
 
 
+def backfill_inference_logprobs(
+    rollouts: GroupedRollouts, request_ledger: dict[str, FinishedRequestRecord]
+) -> None:
+    """Join ledger-offloaded log probs onto TokenRollouts by completion id."""
+    for group in rollouts:
+        for rollout in group:
+            if not isinstance(rollout, TokenRollout) or rollout.logprobs is not None:
+                continue
+            turn_logprobs = []
+            for completion_id in rollout.completion_ids:
+                record = request_ledger.get(completion_id)
+                assert record is not None, (
+                    f"finished-request ledger: no record for {completion_id!r}."
+                )
+                assert record.generated_log_probs is not None, (
+                    f"finished-request ledger: record {completion_id!r} has no logprob payload."
+                )
+                turn_logprobs.append(record.generated_log_probs)
+            rollout.logprobs = turn_logprobs
+
+
 def get_environment_rollouts(
     model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
-) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
+) -> GroupedRollouts:
     """Sample environment rollouts from an LLM.
 
     Args:
@@ -769,7 +790,7 @@ def get_environment_rollouts(
         samples_per_group: Amount of trajectories per prompt.
 
     Returns:
-        (GroupedRollouts, per-request metadata ledger)
+        GroupedRollouts
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -895,7 +916,11 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
 
             with nvtx_range("rl/sync-request-ledger", time=True):
-                request_ledger = inference_interface.merge_global_request_ledgers()
+                fresh_ledger = inference_interface.merge_global_request_ledgers()
+                runtime_state = get_rl_runtime_state()
+                runtime_state.request_ledger.update(fresh_ledger)
+            # Join offloaded log probs before anything reads the rollouts.
+            backfill_inference_logprobs(rollouts, runtime_state.request_ledger)
         logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
@@ -907,7 +932,7 @@ def get_environment_rollouts(
         ) as f:
             json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
-    return rollouts, request_ledger
+    return rollouts
 
 
 def selective_log_softmax(logits, index):
@@ -2623,12 +2648,9 @@ def get_grpo_data_iterator(
         (grpo_iterations * global_batches_per_collection)
     ):
 
-        rollouts, fresh_ledger = get_environment_rollouts(
+        rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
-        # Records persist until their rollout's join pops them (partial rollouts
-        # deliver across window boundaries); never-joined residents are accepted.
-        runtime_state.request_ledger.update(fresh_ledger)
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,

@@ -2168,8 +2168,38 @@ class TestRLUtils:
         hists = [t["data"] for t in tables if t.get("columns") == ["staleness"]]
         assert [[4.6]] in hists and [[1.0]] in hists
 
+    def test_backfill_inference_logprobs(self):
+        """Offloaded rollouts (logprobs=None) join per-turn log probs from the
+        ledger by completion id; echoed/text rollouts and the records are untouched."""
+        offloaded = make_token_rollout([[1, 2], [1, 2, 3, 4]], logprobs=None)
+        echoed = make_token_rollout([[5, 6]], logprobs=[[-0.5, -0.25]])
+        text = Rollout(trajectory=["hello"], reward=1.0, env_id='MEGAENV')
+        ledger = {
+            offloaded.completion_ids[0]: _ledger_record(1, generated_log_probs=[-0.1, -0.2]),
+            offloaded.completion_ids[1]: _ledger_record(2, generated_log_probs=[-0.3]),
+        }
 
-def _ledger_record(epoch, num_evictions=0):
+        rl_utils.backfill_inference_logprobs([[offloaded, echoed, text]], ledger)
+
+        assert offloaded.logprobs == [[-0.1, -0.2], [-0.3]]
+        assert echoed.logprobs == [[-0.5, -0.25]]
+        assert len(ledger) == 2  # peeked, not popped
+
+        # Missing record / record without a payload are hard errors at the join.
+        orphan = make_token_rollout([[7]], logprobs=None)
+        with pytest.raises(AssertionError, match="no record for"):
+            rl_utils.backfill_inference_logprobs([[orphan]], ledger)
+        bare = make_token_rollout([[8]], logprobs=None)
+        with pytest.raises(AssertionError, match="no log-prob payload"):
+            rl_utils.backfill_inference_logprobs(
+                [[bare]], {bare.completion_ids[0]: _ledger_record(3)}
+            )
+
+
+def _ledger_record(epoch, num_evictions=0, generated_log_probs=None):
     return FinishedRequestRecord(
-        policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
+        policy_epoch=[(0, epoch)],
+        kv_cache_epoch=[(0, epoch)],
+        num_evictions=num_evictions,
+        generated_log_probs=generated_log_probs,
     )

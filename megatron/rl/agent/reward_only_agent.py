@@ -11,6 +11,7 @@ from ..inference import (
     InferenceRequest,
     InferenceResponse,
     LLMChatMessage,
+    ReturnsLogProbs,
     ReturnsRaw,
     ReturnsTokens,
 )
@@ -195,7 +196,12 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             return TokenRollout(
                 trajectory=[r.token_ids for r in responses],
                 reward=reward,
-                logprobs=[r.logprobs for r in responses],
+                # Inline logprobs require the ReturnsLogProbs declaration; otherwise None.
+                logprobs=(
+                    [r.logprobs for r in responses]
+                    if isinstance(request.inference_interface, ReturnsLogProbs)
+                    else None
+                ),
                 generation_mask=[
                     [x >= r.prompt_length for x in range(len(r.token_ids))]
                     for r in responses

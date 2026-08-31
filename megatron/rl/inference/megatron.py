@@ -67,10 +67,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
-                # TODO: These are non-standard fields that add significant memory overheads to the
-                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
-                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
-                # Set to False if not needed in MRL.
                 "return_tokenized_data": True,
                 "return_raw_text": True,
             },
@@ -83,7 +79,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
             raw_text=choice.message.raw_text,
             token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
-            logprobs=choice.message.generation_log_probs,
+            logprobs=None,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.message.prompt_token_ids),
             completion_id=response.id,
@@ -110,6 +106,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         inference_engine.local_metadata_ledger_enabled = True
+        inference_engine.local_metadata_ledger_offload_enabled = True
         if args.rl_partial_rollouts:
             # Resolve args.rl_generation_lag against the engine's request capacity:
             # autotune it when unset, or report how the requested lag compares.
@@ -230,9 +227,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
         """Union every engine's local-metadata ledger and clear them."""
         engine = self._inference_engine
-        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
         shards = [None] * dist.get_world_size()
-        dist.all_gather_object(shards, local)
+        dist.all_gather_object(shards, engine.drain_metadata_ledger())
         merged: dict[str, FinishedRequestRecord] = {}
         for shard in shards:
             merged.update(shard)
