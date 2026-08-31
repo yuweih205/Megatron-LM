@@ -26,7 +26,12 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import StreamingChatParser, openai_stream
+from ..openai_streaming import (
+    StreamingChatParser,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
+    openai_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1131,13 +1136,15 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
 
                 # Get top_n_logprobs if available
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs')
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 logprobs_content = []
                 for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
