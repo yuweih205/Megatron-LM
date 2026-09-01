@@ -434,3 +434,46 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+def test_finished_request_record_capture_and_ledger_offload_serialize():
+    """Capture pins the token payload on the record; serialize(ledger_offload=True)
+    drops it from the wire and restores local state; defaults are unchanged."""
+    routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+
+    def make_request():
+        req = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.tensor([1, 2, 3]),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+            generated_tokens=[10, 11],
+        )
+        req.generated_log_probs = [-0.5, -0.25]
+        req.prompt_log_probs = torch.tensor([-1.0, -2.0])
+        req.routing_indices = routing
+        req.policy_epoch = [(2, 3)]
+        return req
+
+    req = make_request()
+    plain = FinishedRequestRecord.from_request(req)
+    assert plain.policy_epoch == [(2, 3)]
+    assert plain.generated_token_ids is None
+
+    captured = FinishedRequestRecord.from_request(req, capture=True)
+    assert captured.prompt_token_ids == [1, 2, 3]
+    assert captured.generated_token_ids == [10, 11]
+    assert captured.generated_log_probs == [-0.5, -0.25]
+    assert captured.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
+    assert captured.routing_indices is routing
+
+    obj = req.serialize(ledger_offload=True)
+    assert obj["ledger_offload"] is True
+    assert obj["generated_log_probs"] is None
+    assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
+    # The drop is wire-only: local state is restored after the send.
+    assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
+
+    obj = make_request().serialize()
+    assert obj["ledger_offload"] is False
+    assert obj["generated_log_probs"] == [-0.5, -0.25]
+    assert obj["routing_indices"][0] == "ndarray"

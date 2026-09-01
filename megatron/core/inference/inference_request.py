@@ -687,6 +687,11 @@ class DynamicInferenceRequest(InferenceRequest):
     # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
 
+    # Marker set by serialize(ledger_offload=True):
+    # part of this request's data has been offload to the finished-request ledger,
+    # and has been dropped from the wire payload.
+    ledger_offload: bool = False
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
@@ -735,8 +740,11 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(self, ledger_offload: bool = False):
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            ledger_offload (bool): The finished-request ledger owns part of this request's data.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -746,24 +754,9 @@ class DynamicInferenceRequest(InferenceRequest):
 
         # The prompt length is always reported (needed for usage.prompt_tokens),
         # but the prompt_tokens tensor is dropped from the wire payload unless the
-        # client asked for it back (return_prompt_tokens). This keeps the large
-        # prompt tensor off the engine->coordinator->API path. Null it around
-        # super() so the tensor is never serialized, then restore local state.
+        # client asked for it back (return_prompt_tokens).
+        # Under ledger offload, log probs and MoE routing indices are likewise dropped.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = (
-            self.prompt_tokens is not None
-            and self.sampling_params is not None
-            and not getattr(self.sampling_params, "return_prompt_tokens", False)
-        )
-        saved_prompt_tokens = None
-        if drop_prompt:
-            saved_prompt_tokens = self.prompt_tokens
-            self.prompt_tokens = None
-
-        obj = super().serialize()
-        obj["events"] = [e.serialize() for e in self.events]
-        obj.pop("event_add_engine", None)
-        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
@@ -775,8 +768,31 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        if drop_prompt:
-            self.prompt_tokens = saved_prompt_tokens
+        sampling_params = self.sampling_params
+        dropped_fields = {}
+        if (
+            self.prompt_tokens is not None
+            and sampling_params is not None
+            and not getattr(sampling_params, "return_prompt_tokens", False)
+        ):
+            dropped_fields["prompt_tokens"] = self.prompt_tokens
+        if ledger_offload:
+            dropped_fields["generated_log_probs"] = self.generated_log_probs
+            dropped_fields["prompt_log_probs"] = self.prompt_log_probs
+            dropped_fields["routing_indices"] = self.routing_indices
+        for field_name in dropped_fields:
+            setattr(self, field_name, None)
+
+        try:
+            obj = super().serialize()
+        finally:
+            for field_name, value in dropped_fields.items():
+                setattr(self, field_name, value)
+
+        obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+        obj["prompt_length"] = prompt_len
+        obj["ledger_offload"] = ledger_offload
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -1134,10 +1150,30 @@ class FinishedRequestRecord:
     policy_epoch: Optional[list[tuple[int, int]]]
     kv_cache_epoch: Optional[list[tuple[int, int]]]
     num_evictions: int
+    prompt_token_ids: Optional[list[int]] = None
+    generated_token_ids: Optional[list[int]] = None
+    generated_log_probs: Optional[list[float]] = None
+    prompt_log_probs: Optional[list[float]] = None
+    routing_indices: Optional[np.ndarray] = None
 
     @classmethod
-    def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
-        """Build the request's non-RESTful metadata from a finished request."""
+    def from_request(
+        cls, request: "DynamicInferenceRequest", capture: bool = False
+    ) -> "FinishedRequestRecord":
+        """Build the request's non-RESTful metadata from a finished request.
+
+        Args:
+            request (DynamicInferenceRequest): The finished (merged) request.
+            capture (bool): Offload part of the request's payload onto the record.
+        """
+
+        def to_plain_list(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.cpu().tolist()
+            return list(value)
+
         # Epoch stamps exist only while the engine has a generation epoch set.
         record = cls(
             policy_epoch=(
@@ -1152,6 +1188,12 @@ class FinishedRequestRecord:
                 1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
             ),
         )
+        if capture:
+            record.prompt_token_ids = to_plain_list(request.prompt_tokens)
+            record.generated_token_ids = to_plain_list(request.generated_tokens)
+            record.generated_log_probs = to_plain_list(request.generated_log_probs)
+            record.prompt_log_probs = to_plain_list(request.prompt_log_probs)
+            record.routing_indices = request.routing_indices
         return record
 
 

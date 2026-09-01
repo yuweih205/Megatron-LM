@@ -37,6 +37,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -1147,6 +1148,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
+    engine.local_metadata_ledger_offload_enabled = False
     request = types.SimpleNamespace(
         generated_tokens=[11, 12, 13],
         generated_log_probs=[-0.1, -0.2, -0.3],
@@ -1168,9 +1170,22 @@ def test_streaming_partials_are_sent():
         engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
     )
     partial = payload[1][0]
+    assert partial["new_log_probs"] == request.generated_log_probs
     assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
     assert partial["prompt_log_probs"] == request.prompt_log_probs
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
+
+    # Under ledger offload, partial frames drop the ledger-owned log probs
+    # while top-n log probs (not a ledger payload) still ride.
+    engine.local_metadata_ledger_offload_enabled = True
+    engine._partial_emit_lengths = {}
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine._try_send_streaming_partials()
+    partial = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )[1][0]
+    assert "new_log_probs" not in partial and "prompt_log_probs" not in partial
+    assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
 
 
 def test_streaming_partials_buffer_until_token_interval():
@@ -3935,6 +3950,83 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ledger = engine.local_metadata_ledger
         assert list(ledger.keys()) == [merged.uid]
         assert ledger[merged.uid].policy_epoch == [(0, 3)]
+        # Telemetry-only mode (offload not enabled) pins no token payload.
+        assert ledger[merged.uid].generated_token_ids is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_local_metadata_ledger_offload_mode(self):
+        """Offload pins token payloads on ledger records and drops them from the
+        reply wire; the custody accessors serve them, and reset never clears them."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine._generation_epoch = 3  # RL mode: requests are epoch-stamped
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.local_metadata_ledger_enabled = True
+        engine.local_metadata_ledger_offload_enabled = True
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.ones(
+                    PROMPT_LEN, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                # The RL client shape: return_log_probs is the compute trigger;
+                # under offload the values ride the ledger, not the wire.
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=NUM_TOKENS, termination_id=-1, return_log_probs=True
+                ),
+            )
+        )
+        finished_records = []
+        while engine.has_unfinished_requests():
+            finished_records.extend(engine.step_modern()["finished_request_records"])
+        merged = finished_records[0].merge()
+
+        # The record pins the exact token payload, keyed by the response uid.
+        record = engine.local_metadata_ledger[merged.uid]
+        assert record.policy_epoch == [(0, 3)]
+        assert record.prompt_token_ids == merged.prompt_tokens.tolist()
+        assert record.generated_token_ids == list(merged.generated_tokens)
+        assert len(record.generated_log_probs) == len(record.generated_token_ids)
+
+        # The reply sent to the coordinator drops the ledger-owned payloads and
+        # marks the takeover; token ids stay — they are the response.
+        header, (wire,) = msgpack.unpackb(
+            engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+        )
+        assert header == Headers.ENGINE_REPLY.value
+        assert wire["uid"] == merged.uid and wire["ledger_offload"] is True
+        assert wire["generated_log_probs"] is None and wire["routing_indices"] is None
+        assert wire["generated_tokens"] == list(merged.generated_tokens)
+
+        # Custody accessors: peek leaves the record, pop removes it, unknown
+        # uids are silently absent.
+        fetched = engine.fetch_from_metadata_ledger([merged.uid, "?"], pop=False)
+        assert fetched == {merged.uid: record} and engine.local_metadata_ledger
+        engine.fetch_from_metadata_ledger([merged.uid])
+        assert not engine.local_metadata_ledger
+
+        # reset() clears request state, never consumer-owned custody state.
+        engine.local_metadata_ledger["chatcmpl-custody"] = record
+        engine.reset()
+        assert engine.local_metadata_ledger_enabled
+        assert engine.local_metadata_ledger_offload_enabled
+        assert engine.drain_metadata_ledger() == {"chatcmpl-custody": record}
+        assert not engine.local_metadata_ledger
 
     @pytest.mark.internal
     @pytest.mark.skipif(

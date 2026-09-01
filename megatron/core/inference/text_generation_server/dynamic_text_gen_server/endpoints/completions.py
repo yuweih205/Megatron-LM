@@ -344,8 +344,12 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
             }
+            # Under ledger offload the engine dropped the log probs from the
+            # reply; consumers join the engine's finished-request ledger by the
+            # response id instead.
+            if not result.get("ledger_offload"):
+                choice_data["generation_log_probs"] = result.get("generated_log_probs", [])
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]

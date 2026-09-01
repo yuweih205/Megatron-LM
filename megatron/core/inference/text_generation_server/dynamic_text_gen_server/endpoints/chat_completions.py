@@ -1257,8 +1257,10 @@ try:
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
+            ledger_offload = bool(result.get("ledger_offload"))
+            if not ledger_offload:
+                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -1296,7 +1298,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if result.get("generated_log_probs") is None:
+            if not ledger_offload and result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),

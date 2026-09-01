@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -326,6 +326,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialize engine.
         self.reset()
 
+        # Finished-request ledger: scratchpad that can be accessed by an external consumer,
+        # without requiring extra data to pass through the RESTful API.
+        self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
+        # By default holds only logging metrics.
+        self.local_metadata_ledger_enabled: bool = False
+        # When offload is also enabled, the RESTful API does not transmit heavy token payloads
+        # (logprobs, MoE routing indices), but they are instead pinned in the ledger.
+        self.local_metadata_ledger_offload_enabled: bool = False
+
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
@@ -466,8 +475,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
-        self.local_metadata_ledger_enabled: bool = False
-        self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -1268,12 +1275,68 @@ class DynamicInferenceEngine(AbstractEngine):
                 assert (
                     merged.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {merged.uid!r}"
-                self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
+                self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(
+                    merged, capture=self.local_metadata_ledger_offload_enabled
+                )
         payload = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, [request.serialize() for request in merged_requests]],
+            [
+                Headers.ENGINE_REPLY.value,
+                [
+                    request.serialize(ledger_offload=self.local_metadata_ledger_offload_enabled)
+                    for request in merged_requests
+                ],
+            ],
             use_bin_type=True,
         )
         self.socket_for_receiving_requests.send(payload)
+
+    def fetch_from_metadata_ledger(
+        self, uids: Iterable[str], pop: bool = True
+    ) -> Dict[str, FinishedRequestRecord]:
+        """Look up finished-request ledger records by uid.
+
+        Missing uids are silently absent from the result (with data-parallel
+        engines, a request finishes on exactly one rank's engine, so consumers
+        typically fan the same uid list out to every rank and union the hits).
+
+        This is the custody-mode accessor: a framework peeks records with
+        pop=False, stages them durably elsewhere, and only then discards them
+        with pop=True. Records persist across training steps until discarded;
+        do not combine with drain_metadata_ledger() on the same engine.
+
+        Args:
+            uids (Iterable[str]): Request uids (the OpenAI response ids) to
+                look up.
+            pop (bool): Remove the returned records from the ledger.
+
+        Returns:
+            (Dict[str, FinishedRequestRecord]) The records present in this
+                engine's ledger, keyed by uid.
+        """
+        found = {}
+        for uid in uids:
+            record = self.local_metadata_ledger.get(uid)
+            if record is not None:
+                found[uid] = record
+        if pop:
+            for uid in found:
+                del self.local_metadata_ledger[uid]
+        return found
+
+    def drain_metadata_ledger(self) -> Dict[str, FinishedRequestRecord]:
+        """Return all finished-request ledger records and reset the ledger.
+
+        This is the barrier-mode accessor: the framework that owns every
+        request on this engine joins all records at once (e.g. Megatron RL at
+        its rollout barrier). Draining an engine whose records are held in
+        custody via fetch_from_metadata_ledger(pop=False) destroys that
+        custody — the two modes must not share an engine.
+
+        Returns:
+            (Dict[str, FinishedRequestRecord]) All records, keyed by uid.
+        """
+        drained, self.local_metadata_ledger = self.local_metadata_ledger, {}
+        return drained
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
@@ -2856,16 +2919,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 new_tokens = list(request.generated_tokens[already:emit_end])
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
-                    partial["new_log_probs"] = list(
-                        (request.generated_log_probs or [])[already:emit_end]
-                    )
+                    # Under ledger offload the finished-request ledger owns the
+                    # log probs; they stay off the reply path, partials included.
+                    # Top-n log probs are not a ledger payload and ride as usual.
+                    offload = self.local_metadata_ledger_offload_enabled
+                    if not offload:
+                        partial["new_log_probs"] = list(
+                            (request.generated_log_probs or [])[already:emit_end]
+                        )
                     partial["new_top_n_logprobs"] = list(
                         (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
                     )
                     if already == 0 and not request.sampling_params.skip_prompt_log_probs:
-                        partial["prompt_log_probs"] = list(
-                            getattr(request, "prompt_log_probs", None) or []
-                        )
+                        if not offload:
+                            partial["prompt_log_probs"] = list(
+                                getattr(request, "prompt_log_probs", None) or []
+                            )
                         partial["prompt_top_n_logprobs"] = list(
                             getattr(request, "prompt_top_n_logprobs", None) or []
                         )
