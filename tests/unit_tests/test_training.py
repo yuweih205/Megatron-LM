@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training as training_module
 from megatron.training.checkpointing import save_grads
@@ -217,6 +218,15 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
 def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch):
     """DSA metrics use the stable physical parent and nominal microbatch divisor."""
     parent_dp_cp_group = object()
+    pp_group = object()
+    dp_group = object()
+    encoder_pg_collection = SimpleNamespace(mp=None, pp=object(), dp=object(), dp_cp=object())
+    language_pg_collection = SimpleNamespace(
+        mp=object(), pp=pp_group, dp=dp_group, dp_cp=parent_dp_cp_group
+    )
+    schedule_pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"language": language_pg_collection}, language_model_module_name="language"
+    )
     recorded = []
     args = SimpleNamespace(
         consumed_train_samples=0,
@@ -270,14 +280,38 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         params_norm=None,
         num_zeros_in_grad=None,
         max_attention_logit=None,
-        pg_collection=SimpleNamespace(dp_cp=parent_dp_cp_group, mp=None),
+        pg_collection=encoder_pg_collection,
+        schedule_pg_collection=schedule_pg_collection,
     )
 
     assert len(recorded) == 1
     assert recorded[0]["loss_scale"] == 1 / 7
     assert recorded[0]["dynamic_cp_parent_group"] is parent_dp_cp_group
+    assert recorded[0]["pp_group"] is pp_group
+    assert recorded[0]["dp_group"] is dp_group
     assert recorded[0]["configured_cp_size"] == 4
     assert recorded[0]["num_layers"] == 4
+
+    recorded.clear()
+    encoder_only_schedule = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder": encoder_pg_collection}, language_model_module_name=None
+    )
+    training_module.training_log(
+        {},
+        {},
+        learning_rate=1.0e-4,
+        iteration=1,
+        loss_scale=1.0,
+        report_memory_flag=False,
+        skipped_iter=0,
+        grad_norm=None,
+        params_norm=None,
+        num_zeros_in_grad=None,
+        max_attention_logit=None,
+        pg_collection=encoder_pg_collection,
+        schedule_pg_collection=encoder_only_schedule,
+    )
+    assert recorded == []
 
 
 class TestGetModelBucketSizingPgCollection:

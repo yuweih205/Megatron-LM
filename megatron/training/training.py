@@ -3397,6 +3397,15 @@ def train_step(
     )
 
 
+def _resolve_dsa_metric_pg_collection(model_pg_collection, schedule_pg_collection):
+    """Resolve language-model metric groups and rank membership for DSA logging."""
+    if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+        if not schedule_pg_collection.has_language_model():
+            return False, None
+        return True, schedule_pg_collection.get_language_model_collection()
+    return True, model_pg_collection
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3414,6 +3423,7 @@ def training_log(
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
     num_microbatches: int | None = None,
+    schedule_pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3658,12 +3668,29 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = _resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection
+    )
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Sequence packing may pass the physical packed microbatch count to training_log, but
+        # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
+        # samples. Normalize by the calculator's nominal scheduled count deliberately.
         indexer_loss_scale = 1 / get_num_microbatches()
+        pp_group = None
+        dp_group = None
         dynamic_cp_parent_group = None
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            dp_group = dsa_metric_pg_collection.dp
         if args.dynamic_context_parallel:
-            dynamic_cp_parent_group = getattr(pg_collection, "dp_cp", None)
-            if dynamic_cp_parent_group is None:
+            if dsa_metric_pg_collection is not None:
+                dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
+            else:
+                # Legacy training entry points without a process-group collection.
                 dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
@@ -3680,6 +3707,8 @@ def training_log(
             preserve_groups=args.cuda_graph_impl != "none",
             dynamic_cp_parent_group=dynamic_cp_parent_group,
             configured_cp_size=args.context_parallel_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -4561,6 +4590,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
@@ -4870,6 +4900,7 @@ def train(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             num_microbatches=num_microbatches,
+            schedule_pg_collection=pg_collection,
         )
         is_first_iteration = False
 
